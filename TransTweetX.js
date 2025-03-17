@@ -1,9 +1,10 @@
 // ==UserScript==
 // @name         TransTweetX
 // @namespace    http://tampermonkey.net/
-// @version      1.1
+// @version      1.2
 // @description  TransTweetX offers precise, emoji-friendly translations for Twitter/X feed.
 // @author       Ian
+// @license      MIT
 // @match        https://twitter.com/*
 // @match        https://x.com/*
 // @grant        GM_xmlhttpRequest
@@ -27,8 +28,8 @@
         },
         translationInterval: 200,
         maxRetry: 3,
-        concurrentRequests: 2, // 同时进行的请求数
-        baseDelay: 100, // 基础间隔时间
+        concurrentRequests: 2,
+        baseDelay: 100,
         translationStyle: {
             color: 'inherit',
             fontSize: '0.9em',
@@ -37,12 +38,18 @@
             margin: '4px 0',
             whiteSpace: 'pre-wrap',
             opacity: '0.8'
+        },
+        viewportPriority: {
+            centerRadius: 200,
+            updateInterval: 500,
+            maxPriorityItems: 5
         }
     };
 
     let processingQueue = new Set();
     let requestQueue = [];
     let isTranslating = false;
+    let visibleTweets = new Map();
 
     // 初始化控制面板
     function initControlPanel() {
@@ -188,10 +195,17 @@
         });
     }
 
-    // 队列处理系统
+    // 智能队列处理
     async function processQueue() {
         if (isTranslating || requestQueue.length === 0) return;
         isTranslating = true;
+
+        // 优先级排序
+        requestQueue.sort((a, b) => {
+            const aDist = distanceToViewportCenter(a.tweet);
+            const bDist = distanceToViewportCenter(b.tweet);
+            return aDist - bDist;
+        });
 
         const workers = Array.from({ length: config.concurrentRequests }, async () => {
             while (requestQueue.length > 0) {
@@ -199,7 +213,7 @@
                 try {
                     const translated = await translateWithEmoji(text);
                     updateTranslation(tweet, translated);
-                    await delay(config.baseDelay + Math.random() * 50); // 添加随机延迟避免封禁
+                    await delay(config.baseDelay + Math.random() * 50);
                 } catch (error) {
                     if (retryCount < config.maxRetry) {
                         requestQueue.push({ tweet, text, retryCount: retryCount + 1 });
@@ -212,6 +226,54 @@
 
         await Promise.all(workers);
         isTranslating = false;
+    }
+
+    // 可视区域追踪
+    function setupViewportTracker() {
+        let lastUpdate = 0;
+
+        const updatePositions = () => {
+            const now = Date.now();
+            if (now - lastUpdate < config.viewportPriority.updateInterval) return;
+            lastUpdate = now;
+
+            document.querySelectorAll(config.tweetSelector).forEach(tweet => {
+                const rect = tweet.getBoundingClientRect();
+                if (rect.top < window.innerHeight && rect.bottom > 0) {
+                    visibleTweets.set(tweet, getElementCenter(tweet));
+                } else {
+                    visibleTweets.delete(tweet);
+                }
+            });
+        };
+
+        window.addEventListener('scroll', () => {
+            requestAnimationFrame(updatePositions);
+        }, { passive: true });
+
+        setInterval(updatePositions, config.viewportPriority.updateInterval);
+    }
+
+    // 获取元素中心坐标
+    function getElementCenter(el) {
+        const rect = el.getBoundingClientRect();
+        return {
+            x: rect.left + rect.width/2,
+            y: rect.top + rect.height/2
+        };
+    }
+
+    // 计算视口中心距离
+    function distanceToViewportCenter(el) {
+        const viewportCenter = {
+            x: window.innerWidth/2,
+            y: window.innerHeight/2
+        };
+        const elCenter = visibleTweets.get(el) || getElementCenter(el);
+        return Math.hypot(
+            elCenter.x - viewportCenter.x,
+            elCenter.y - viewportCenter.y
+        );
     }
 
     // 精准文本提取
@@ -243,10 +305,12 @@
 
     // Emoji感知翻译
     async function translateWithEmoji(text) {
+        const MIN_SEGMENT_LENGTH = 50;
         const segments = [];
         let lastIndex = 0;
         const emojiRegex = /(\p{Extended_Pictographic}|\p{Emoji_Component}+)/gu;
 
+        // 分割文本和Emoji
         for (const match of text.matchAll(emojiRegex)) {
             const [emoji] = match;
             const index = match.index;
@@ -261,8 +325,29 @@
             segments.push({ type: 'text', content: text.slice(lastIndex) });
         }
 
-        const translated = [];
+        // 合并短文本
+        const mergedSegments = [];
+        let buffer = [];
         for (const seg of segments) {
+            if (seg.type === 'text') {
+                buffer.push(seg.content);
+                if (buffer.join(' ').length >= MIN_SEGMENT_LENGTH) {
+                    mergedSegments.push({ type: 'text', content: buffer.join(' ') });
+                    buffer = [];
+                }
+            } else {
+                if (buffer.length > 0) {
+                    mergedSegments.push({ type: 'text', content: buffer.join(' ') });
+                    buffer = [];
+                }
+                mergedSegments.push(seg);
+            }
+        }
+        if (buffer.length > 0) mergedSegments.push({ type: 'text', content: buffer.join(' ') });
+
+        // 执行翻译
+        const translated = [];
+        for (const seg of mergedSegments) {
             if (seg.type === 'emoji') {
                 translated.push(seg.content);
             } else {
@@ -311,11 +396,13 @@
         const container = createTranslationContainer();
         tweet.after(container);
 
-        requestQueue.push({
-            tweet,
-            text: originalText,
-            retryCount: 0
-        });
+        // 根据位置动态插入队列
+        const distance = distanceToViewportCenter(tweet);
+        if (distance < config.viewportPriority.centerRadius) {
+            requestQueue.unshift({ tweet, text: originalText, retryCount: 0 });
+        } else {
+            requestQueue.push({ tweet, text: originalText, retryCount: 0 });
+        }
 
         processQueue();
     }
@@ -375,27 +462,15 @@
     // 工具函数
     const delay = ms => new Promise(r => setTimeout(r, ms));
 
-    // 懒加载
-    function setupLazyLoad() {
-    const observer = new IntersectionObserver((entries) => {
-        entries.forEach(entry => {
-            if (entry.isIntersecting) {
-                const tweet = entry.target.closest(config.tweetSelector);
-                tweet && processTweet(tweet);
-            }
-        });
-    }, { rootMargin: '200px 0px' });
-
-    document.querySelectorAll(config.tweetSelector).forEach(tweet => {
-        observer.observe(tweet);
-    });
-}
-
     // 初始化入口
     function init() {
         initControlPanel();
+        setupViewportTracker();
         setupMutationObserver();
-        setupLazyLoad();
+        document.querySelectorAll(config.tweetSelector).forEach(tweet => {
+            visibleTweets.set(tweet, getElementCenter(tweet));
+            processTweet(tweet);
+        });
     }
 
     // 启动脚本
