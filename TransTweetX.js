@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TransTweetX
 // @namespace    http://tampermonkey.net/
-// @version      1.0
+// @version      1.1
 // @description  TransTweetX offers precise, emoji-friendly translations for Twitter/X feed.
 // @author       Ian
 // @match        https://twitter.com/*
@@ -27,6 +27,8 @@
         },
         translationInterval: 200,
         maxRetry: 3,
+        concurrentRequests: 2, // 同时进行的请求数
+        baseDelay: 100, // 基础间隔时间
         translationStyle: {
             color: 'inherit',
             fontSize: '0.9em',
@@ -191,21 +193,24 @@
         if (isTranslating || requestQueue.length === 0) return;
         isTranslating = true;
 
-        while (requestQueue.length > 0) {
-            const { tweet, text, retryCount } = requestQueue.shift();
-            try {
-                const translated = await translateWithEmoji(text);
-                updateTranslation(tweet, translated);
-                await delay(config.translationInterval);
-            } catch (error) {
-                if (retryCount < config.maxRetry) {
-                    requestQueue.push({ tweet, text, retryCount: retryCount + 1 });
-                } else {
-                    markTranslationFailed(tweet);
+        const workers = Array.from({ length: config.concurrentRequests }, async () => {
+            while (requestQueue.length > 0) {
+                const { tweet, text, retryCount } = requestQueue.shift();
+                try {
+                    const translated = await translateWithEmoji(text);
+                    updateTranslation(tweet, translated);
+                    await delay(config.baseDelay + Math.random() * 50); // 添加随机延迟避免封禁
+                } catch (error) {
+                    if (retryCount < config.maxRetry) {
+                        requestQueue.push({ tweet, text, retryCount: retryCount + 1 });
+                    } else {
+                        markTranslationFailed(tweet);
+                    }
                 }
             }
-        }
+        });
 
+        await Promise.all(workers);
         isTranslating = false;
     }
 
@@ -370,11 +375,27 @@
     // 工具函数
     const delay = ms => new Promise(r => setTimeout(r, ms));
 
+    // 懒加载
+    function setupLazyLoad() {
+    const observer = new IntersectionObserver((entries) => {
+        entries.forEach(entry => {
+            if (entry.isIntersecting) {
+                const tweet = entry.target.closest(config.tweetSelector);
+                tweet && processTweet(tweet);
+            }
+        });
+    }, { rootMargin: '200px 0px' });
+
+    document.querySelectorAll(config.tweetSelector).forEach(tweet => {
+        observer.observe(tweet);
+    });
+}
+
     // 初始化入口
     function init() {
         initControlPanel();
         setupMutationObserver();
-        document.querySelectorAll(config.tweetSelector).forEach(processTweet);
+        setupLazyLoad();
     }
 
     // 启动脚本
