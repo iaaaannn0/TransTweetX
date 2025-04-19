@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         TransTweetX
 // @namespace    http://tampermonkey.net/
-// @version      1.3
-// @description  TransTweetX offers precise, emoji-friendly translations for Twitter/X feed.
+// @version      1.4
+// @description  TransTweetX offers precise, emoji‑friendly translations for Twitter/X feed and now automatically retranslates text revealed after hitting “Show more/Read more”.
 // @author       Ian
 // @license      MIT
 // @match        https://twitter.com/*
@@ -15,6 +15,9 @@
 (function () {
   'use strict';
 
+  /*───────────────────────────
+   *  CONFIGURATION
+   *──────────────────────────*/
   const config = {
     tweetSelector: '[data-testid="tweetText"]',
     targetLang: 'zh-CN',
@@ -48,14 +51,18 @@
     }
   };
 
+  /*───────────────────────────
+   *  STATE
+   *──────────────────────────*/
   let processingQueue = new Set();
   let requestQueue = [];
   let isTranslating = false;
-  let visibleTweets = new Map();
+  const visibleTweets = new Map();
 
-  function delay(ms) {
-    return new Promise(resolve => setTimeout(resolve, ms));
-  }
+  /*───────────────────────────
+   *  UTILS
+   *──────────────────────────*/
+  const delay = ms => new Promise(res => setTimeout(res, ms));
 
   async function translateAndDetectLanguage(text) {
     return new Promise(resolve => {
@@ -93,12 +100,16 @@
   function extractPerfectText(tweet) {
     const clone = tweet.cloneNode(true);
     clone.querySelectorAll('a, button, [data-testid="card.wrapper"]').forEach(el => {
+      // Preserve emoji links, drop the rest
       if (!el.innerHTML.match(/[\p{Extended_Pictographic}\p{Emoji_Component}]/gu)) el.remove();
     });
-    clone.innerHTML = clone.innerHTML.replace(/<br\s*\/?>/gi, '\n');
+    clone.innerHTML = clone.innerHTML.replace(/<br\s*\/?>(?=\n?)/gi, '\n');
     return clone.textContent.replace(/[\u00A0\u200B]+/g, ' ').trim();
   }
 
+  /*───────────────────────────
+   *  TRANSLATION PIPELINE
+   *──────────────────────────*/
   function createTranslationContainer() {
     const container = document.createElement('div');
     container.className = 'translation-container';
@@ -107,13 +118,41 @@
     return container;
   }
 
+  function watchTweetChanges(tweet) {
+    if (tweet.dataset.transWatcher) return; // already watching
+
+    const observer = new MutationObserver(() => {
+      const updatedText = extractPerfectText(tweet);
+      if (!updatedText || tweet.dataset.lastOriginalText === updatedText) return;
+
+      tweet.dataset.lastOriginalText = updatedText;
+      const container = tweet.nextElementSibling;
+      if (container?.classList.contains('translation-container')) {
+        container.innerHTML = '<div class="loading-spinner"></div>';
+      }
+
+      // push to front so the user sees update quickly
+      requestQueue.unshift({ tweet, text: updatedText, retryCount: 0 });
+      processQueue();
+    });
+
+    observer.observe(tweet, { childList: true, characterData: true, subtree: true });
+    tweet.dataset.transWatcher = 'true';
+  }
+
   function processTweet(tweet) {
     if (processingQueue.has(tweet) || tweet.dataset.transProcessed) return;
     processingQueue.add(tweet);
-    tweet.dataset.transProcessed = true;
+    tweet.dataset.transProcessed = 'true';
 
     const originalText = extractPerfectText(tweet);
-    if (!originalText) return;
+    if (!originalText) {
+      processingQueue.delete(tweet);
+      return;
+    }
+
+    // store text for change detection
+    tweet.dataset.lastOriginalText = originalText;
 
     const container = createTranslationContainer();
     tweet.after(container);
@@ -126,6 +165,7 @@
       requestQueue.push(request);
     }
 
+    watchTweetChanges(tweet);
     processQueue();
   }
 
@@ -133,6 +173,7 @@
     if (isTranslating || requestQueue.length === 0) return;
     isTranslating = true;
 
+    // closest to viewport centre first
     requestQueue.sort((a, b) => distanceToViewportCenter(a.tweet) - distanceToViewportCenter(b.tweet));
     const batch = requestQueue.splice(0, config.concurrentRequests);
 
@@ -165,15 +206,18 @@
     }
   }
 
-  function setupMutationObserver() {
-    const observer = new MutationObserver(mutations => {
-      mutations.forEach(m => {
-        m.addedNodes.forEach(node => {
-          if (node.nodeType === 1) node.querySelectorAll(config.tweetSelector).forEach(processTweet);
-        });
-      });
-    });
-    observer.observe(document, { childList: true, subtree: true });
+  /*───────────────────────────
+   *  VIEWPORT TRACKING
+   *──────────────────────────*/
+  function getElementCenter(el) {
+    const rect = el.getBoundingClientRect();
+    return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+  }
+
+  function distanceToViewportCenter(el) {
+    const center = { x: window.innerWidth / 2, y: window.innerHeight / 2 };
+    const elCenter = visibleTweets.get(el) || getElementCenter(el);
+    return Math.hypot(center.x - elCenter.x, center.y - elCenter.y);
   }
 
   function setupViewportTracker() {
@@ -191,17 +235,23 @@
     setInterval(update, config.viewportPriority.updateInterval);
   }
 
-  function getElementCenter(el) {
-    const rect = el.getBoundingClientRect();
-    return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+  /*───────────────────────────
+   *  MUTATION OBSERVER (new tweets)
+   *──────────────────────────*/
+  function setupMutationObserver() {
+    const observer = new MutationObserver(mutations => {
+      mutations.forEach(m => {
+        m.addedNodes.forEach(node => {
+          if (node.nodeType === 1) node.querySelectorAll(config.tweetSelector).forEach(processTweet);
+        });
+      });
+    });
+    observer.observe(document, { childList: true, subtree: true });
   }
 
-  function distanceToViewportCenter(el) {
-    const center = { x: window.innerWidth / 2, y: window.innerHeight / 2 };
-    const elCenter = visibleTweets.get(el) || getElementCenter(el);
-    return Math.hypot(center.x - elCenter.x, center.y - elCenter.y);
-  }
-
+  /*───────────────────────────
+   *  CONTROL PANEL
+   *──────────────────────────*/
   function initControlPanel() {
     const panelHTML = `
       <div id="trans-panel">
@@ -251,6 +301,9 @@
         config.targetLang = this.dataset.lang;
         refreshAllTranslations();
         menu.classList.remove('show');
+        // update highlight
+        document.querySelectorAll('.lang-item.target').forEach(li => li.style.color = '');
+        this.style.color = '#1da1f2';
       });
     });
 
@@ -272,6 +325,9 @@
     });
   }
 
+  /*───────────────────────────
+   *  REFRESH UTIL (when targetLang changed)
+   *──────────────────────────*/
   function refreshAllTranslations() {
     document.querySelectorAll('.translation-container').forEach(el => el.remove());
     processingQueue.clear();
@@ -282,6 +338,9 @@
     });
   }
 
+  /*───────────────────────────
+   *  INIT
+   *──────────────────────────*/
   function init() {
     initControlPanel();
     setupViewportTracker();
